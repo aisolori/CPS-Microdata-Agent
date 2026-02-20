@@ -1,0 +1,659 @@
+```{r}
+library(getCPS)
+library(tidyverse)
+library(ellmer)
+library(jsonlite)
+```
+```{r}
+# 1. Create a dedicated environment to store the data
+# This acts as the Agent's "Working Memory"
+agent_memory <- new.env()
+agent_memory$datasets <- list()     # name -> dataframe
+agent_memory$active   <- NULL       # name of current dataset
+
+
+#------ Agent Memory Functions ------
+agent_save_df <- function(name, df, overwrite = FALSE) {
+  stopifnot(is.character(name), length(name) == 1, nzchar(name))
+  if (!overwrite && !is.null(agent_memory$datasets[[name]])) {
+    stop(sprintf("Dataset '%s' already exists. Set overwrite=TRUE to replace.", name))
+  }
+  agent_memory$datasets[[name]] <- df
+  agent_memory$active <- name
+  invisible(TRUE)
+}
+
+agent_get_df <- function(name = NULL) {
+  if (is.null(name)) name <- agent_memory$active
+  if (is.null(name) || is.null(agent_memory$datasets[[name]])) {
+    stop("No active dataset set (or dataset not found).")
+  }
+  agent_memory$datasets[[name]]
+}
+
+agent_set_active <- function(name) {
+  if (is.null(agent_memory$datasets[[name]])) stop(sprintf("Dataset '%s' not found.", name))
+  agent_memory$active <- name
+  invisible(TRUE)
+}
+
+agent_list_datasets <- function() {
+  nm <- names(agent_memory$datasets)
+  if (length(nm) == 0) return("No datasets stored yet.")
+  paste0("Datasets in memory: ", paste(nm, collapse = ", "),
+         "\nActive: ", ifelse(is.null(agent_memory$active), "NONE", agent_memory$active))
+}
+
+##----- Registered Tools ------
+tool_set_active <- tool(
+  agent_set_active,
+  name = "set_active_dataset",
+  description = "Sets which stored dataset is currently active.",
+  arguments = list(
+    name = type_string("Dataset name to activate (must already exist).")
+  )
+)
+
+tool_list_data <- tool(
+  agent_list_datasets,
+  name = "list_datasets",
+  description = "Lists all datasets currently stored in memory and shows the active one.",
+  arguments = list()
+)
+
+
+
+
+
+#------ Planning Tool ------
+agent_create_plan <- function(plan_text) {
+  message("📝 Agent Strategy:\n", plan_text)
+  return("Plan logged successfully. Proceed with Step 1 of your plan.")
+}
+
+##------- Register Planning Tool ------
+tool_plan <- tool(
+  agent_create_plan,
+  name = "create_analysis_plan",
+  description = "Call this tool FIRST to log your step-by-step strategy for answering the user's question. Outline the variables you need, the cleaning steps (filtering), and the final calculation.",
+  arguments = list(plan_text = type_string("The detailed plan text."))
+)
+
+
+# Data Transformation Function
+agent_transform_data <- function(operation, expression, dataset_name = NULL) {
+  message(sprintf("🛠️ Transforming Data (%s): %s -> %s",
+                  ifelse(is.null(dataset_name), paste0("active=", agent_memory$active), dataset_name),
+                  operation, expression))
+
+  tryCatch({
+    df <- agent_get_df(dataset_name)
+
+    if (operation == "filter") {
+      df <- df %>% filter(eval(parse(text = expression)))
+      msg <- sprintf("Success: Filtered data. Remaining rows: %d", nrow(df))
+    } else if (operation == "mutate") {
+      eval_code <- paste0("df %>% mutate(", expression, ")")
+      df <- eval(parse(text = eval_code))
+      msg <- "Success: New variable created."
+    } else {
+      return("Error: Operation must be 'filter' or 'mutate'.")
+    }
+
+    # save back to same slot
+    name_to_save <- if (is.null(dataset_name)) agent_memory$active else dataset_name
+    agent_save_df(name_to_save, df, overwrite = TRUE)
+
+    # keep alias updated for backward compatibility
+    assign("cps_data", df, envir = agent_memory)
+
+    msg
+  }, error = function(e) paste("Transformation Error:", e$message))
+}
+
+
+tool_transform <- tool(
+  agent_transform_data,
+  name = "transform_data",
+  description = "Filter/mutate the active dataset (or a specified dataset_name).",
+  arguments = list(
+    operation = type_string("Either 'filter' or 'mutate'"),
+    expression = type_string("Filter/mutate expression string."),
+    dataset_name = type_string("Optional. Dataset to operate on; if omitted, uses active dataset.")
+  )
+)
+
+
+# Function to fetch and store CPS data in the agent's memory
+agent_get_cps <- function(year_range, variable_list, state_code = "32",
+                          dataset_name = NULL, make_active = TRUE) {
+
+  # Preserve current active dataset in case make_active = FALSE
+  prev_active <- agent_memory$active
+
+  # Validate inputs
+  if (any(is.na(year_range)))  return("ERROR: You passed NA or NA_integer in 'year_range', violating the instructions, this will cause errors. Please provide valid years without NA.")
+  if (any(is.na(variable_list))) return("ERROR: 'variable_list' contains NA values. Please provide valid variable codes without NA.")
+  if (any(grepl('date', tolower(variable_list)))) return("ERROR: 'variable_list' should not contain 'DATE' variable. It is included by default. You did not follow the instructions.")
+  if (any(grepl('state', tolower(variable_list)))) return("ERROR: 'variable_list' should not contain 'STATE' variable. It is included by default. You did not follow the instructions.")
+
+  message(sprintf("🤖 Fetching data for state %s...", state_code))
+
+  # Fetch CPS data
+  data <- get_cps_data_state(
+    year_range    = as.numeric(year_range),
+    variable_list = as.character(variable_list),
+    state_code    = as.character(state_code)
+  )
+
+  # Metadata / receipt
+  min_date <- min(data$DATE, na.rm = TRUE)
+  max_date <- max(data$DATE, na.rm = TRUE)
+  loaded_states <- paste(unique(data$STATE), collapse = ", ")
+
+  # Default dataset name if not provided
+  if (is.null(dataset_name) || !nzchar(dataset_name)) {
+    dataset_name <- sprintf(
+      "cps_%s_%s_%s",
+      as.character(state_code),
+      as.character(min(as.numeric(year_range))),
+      as.character(max(as.numeric(year_range)))
+    )
+  }
+
+  # Store dataset (agent_save_df sets active to dataset_name)
+  agent_save_df(dataset_name, data, overwrite = TRUE)
+
+  # Honor make_active:
+  # - If TRUE: keep active as the new dataset and update cps_data alias to new data
+  # - If FALSE: revert active to previous and keep cps_data alias synced to active (if any)
+  if (!isTRUE(make_active)) {
+    agent_memory$active <- prev_active
+    if (!is.null(prev_active) && !is.null(agent_memory$datasets[[prev_active]])) {
+      assign("cps_data", agent_memory$datasets[[prev_active]], envir = agent_memory)
+    }
+  } else {
+    assign("cps_data", data, envir = agent_memory)
+  }
+
+  sprintf(
+    paste0(
+      "SUCCESS: Data loaded into dataset '%s'.\n",
+      "- Rows: %d\n",
+      "- Columns: %s\n",
+      "- DATE RANGE: %s to %s\n",
+      "- STATE CODES: %s\n",
+      "Active dataset: %s"
+    ),
+    dataset_name,
+    nrow(data),
+    paste(names(data), collapse = ", "),
+    min_date,
+    max_date,
+    loaded_states,
+    ifelse(is.null(agent_memory$active), "NONE", agent_memory$active)
+  )
+}
+
+
+# 3. New Analysis Function
+agent_analyze_data <- function(r_code, dataset_name = NULL) {
+  message(sprintf("⚡ Agent executing code on %s:\n%s",
+                  ifelse(is.null(dataset_name), paste0("active=", agent_memory$active), dataset_name),
+                  r_code))
+
+  tryCatch({
+    df <- agent_get_df(dataset_name)
+
+    # Put df into a local evaluation env so user code can use cps_data
+    eval_env <- list2env(list(cps_data = df), parent = agent_memory)
+
+    result <- eval(parse(text = r_code), envir = eval_env)
+
+    if (is.data.frame(result) && nrow(result) > 50) return(head(result, 50))
+    result
+  }, error = function(e) paste("R EXECUTION ERROR:", e$message))
+}
+
+
+
+# Wrapper: "Search the Data Dictionary"
+# Update the wrapper to use memory
+agent_search_vars <- function(year = "2023", month = "jan", search_term = NULL, force = FALSE) {
+  
+   # --- COERCE TOOL ARGS TO SAFE SCALARS ---
+  year <- as.character(unlist(year))[1]
+  month <- as.character(unlist(month))[1]
+  search_term <- as.character(unlist(search_term))[1]
+  force <- isTRUE(unlist(force)[1])
+
+  # normalize month
+  month <- tolower(trimws(month))
+  year <- trimws(year)
+  search_term <- trimws(search_term)
+
+  # --- MEMORY CHECK ---
+  if (!exists("search_history", envir = agent_memory)) {
+    assign("search_history", character(), envir = agent_memory)
+  }
+
+  if (is.null(search_term) || trimws(search_term) == "") {
+    return(list(
+      status = "error",
+      message = "You must provide a non-empty 'search_term'."
+    ))
+  }
+
+  norm_term <- tolower(trimws(search_term))
+  search_key <- paste(year, month, norm_term, sep = "|")
+  history <- get("search_history", envir = agent_memory)
+
+  if (!force && (search_key %in% history)) {
+    message(sprintf("⚠️ Agent tried to repeat search: '%s'. Blocking to save time.", search_term))
+
+    # A small synonym bank (customize as you like)
+    synonym_suggestions <- list(
+      "visual disability" = c("seeing", "blind", "difficulty seeing", "glasses", "vision"),
+      "naics"             = c("industry", "industry code", "naics code", "sector", "business"),
+      "income"            = c("earnings", "wages", "salary", "family income", "personal income")
+    )
+
+    # pick suggestions if we have them, otherwise generic
+    suggested_synonyms <- synonym_suggestions[[norm_term]]
+    if (is.null(suggested_synonyms)) {
+      suggested_synonyms <- c(
+        paste0(norm_term, " synonym"),
+        paste0(norm_term, " code"),
+        paste0(norm_term, " variable"),
+        sub(" ", "", norm_term)
+      )
+    }
+
+    return(list(
+      status = "blocked",
+      message = sprintf(
+        "Repeat search blocked: '%s' already searched in %s-%s.",
+        search_term, month, year
+      ),
+      suggested_synonyms = suggested_synonyms,
+      suggested_next_steps = c(
+        "Try one of the suggested synonyms with search_cps_variables.",
+        "Or proceed to the next workflow step if this variable was already found."
+      ),
+      # Optional: show the model *exactly* what a next tool call could look like
+      suggested_next_tool_calls = lapply(suggested_synonyms, function(s) {
+        list(tool = "search_cps_variables",
+             args = list(year = as.character(year), month = as.character(month), search_term = s))
+      }),
+      override = "If you truly need to repeat, call this tool with force=TRUE."
+    ))
+  }
+
+  # Log search
+  assign("search_history", c(history, search_key), envir = agent_memory)
+
+  # --- EXECUTION ---
+  message(sprintf("🔍 Agent is looking up variables in %s-%s for keyword: '%s'",
+                  month, year, search_term))
+
+  full_table <- cps_var_table(year = as.character(year), month = as.character(month))
+
+  matches <- full_table %>%
+    dplyr::filter(
+      grepl(search_term, Name, ignore.case = TRUE) |
+        grepl(search_term, Label, ignore.case = TRUE)
+    ) %>%
+    dplyr::select(Name, Label)
+
+  if (nrow(matches) == 0) {
+    return(list(
+      status = "no_results",
+      message = sprintf("No variables found matching '%s'. Try different keywords", search_term)
+    ))
+  } else {
+    return(list(
+      status = "ok",
+      results = head(matches, 50),
+      message = "Utilize the results to proceed with answering the user's question."
+    ))
+  }
+}
+
+# Wrapper for suggested_weight
+agent_get_weight <- function(variable, year = "2023") {
+  
+  message(sprintf("⚖️ Agent is checking weight for variable: '%s' (%s)", variable, year))
+  
+  # Capture the print output from the original function
+  # because the original function prints instead of returning a string.
+  output <- capture.output({
+    result <- tryCatch(
+      suggested_weight(variable = as.character(variable), year = as.character(year)),
+      error = function(e) "Error retrieving weight."
+    )
+    # If the function returns a value invisibly, print it so capture.output sees it
+    if (!is.null(result)) print(result)
+  })
+  
+  # Clean up the output to a single string for the AI
+  return(paste(output, collapse = "\n"))
+}
+
+
+agent_get_labels <- function(variable, year = "2024", month = "jan") {
+  
+  # Standardize month
+  month_clean <- substr(tolower(month), 1, 3)
+  url <- sprintf("https://api.census.gov/data/%s/cps/basic/%s/variables/%s.json",
+                 year, month_clean, variable)
+  
+  message(sprintf("🏷️ Fetching JSON for: %s", variable))
+  
+  tryCatch({
+    # 1. Fetch the raw list from Census
+    raw_data <- jsonlite::fromJSON(url, simplifyVector = FALSE)
+    
+    # 2. Convert that list BACK to a clean JSON string for the Agent
+    # We use auto_unbox so "name": "PRTAGE" doesn't become "name": ["PRTAGE"]
+    json_output <- jsonlite::toJSON(raw_data, auto_unbox = TRUE, pretty = TRUE)
+    
+    return(as.character(json_output))
+    
+  }, error = function(e) {
+    return(sprintf("{\"error\": \"Could not find variable '%s'. Check spelling or try a different variable .\"}", variable))
+  })
+}
+
+
+agent_explore_var <- function(variable, year = "2024", month = "jan") {
+  
+  message(sprintf("🔍 Agent is analyzing variable: %s", variable))
+  
+  # --- STEP 1: Check if data exists in memory ---
+  if (is.null(agent_memory$active) || is.null(agent_memory$datasets[[agent_memory$active]])) {
+  return("Error: No active dataset set. Load data first or set active dataset.")}
+
+  
+  df <- agent_get_df()  # active dataset
+  if (!variable %in% names(df)) {
+    return(paste("Error: Variable", variable, "not found in the loaded dataset."))
+  }
+  
+  raw_vals <- df[[variable]]
+  
+  # --- STEP 2: Consult the "Source of Truth" (API Metadata) ---
+  month_clean <- substr(tolower(month), 1, 3)
+  url <- sprintf("https://api.census.gov/data/%s/cps/basic/%s/variables/%s.json",
+                 year, month_clean, variable)
+  
+  # Default assumption if API fails: guess based on R type
+  is_categorical <- is.character(raw_vals) || is.factor(raw_vals)
+  label_map <- NULL 
+  valid_range <- NULL
+  
+  tryCatch({
+    meta <- jsonlite::fromJSON(url, simplifyVector = FALSE)
+    
+    # THE CORRECTION: Specific check for 'item' vs 'range'
+    if (!is.null(meta$values)) {
+      
+      # CASE A: Categorical (Has 'item' list)
+      if (!is.null(meta$values$item)) {
+        is_categorical <- TRUE
+        # Flatten the list of items into a named vector
+        items <- meta$values$item
+        label_map <- unlist(items)
+      } 
+      
+      # CASE B: Continuous (Has 'range' list)
+      else if (!is.null(meta$values$range)) {
+        is_categorical <- FALSE 
+        valid_range <- meta$values$range # Capture min/max to flag outliers
+      }
+    }
+  }, error = function(e) {
+    message("Warning: Could not fetch metadata. Falling back to basic type check.")
+  })
+  
+  # --- STEP 3: Generate the Summary ---
+  
+  # PATH A: CATEGORICAL
+  if (is_categorical) {
+    counts <- table(raw_vals)
+    total <- sum(counts)
+    counts <- sort(counts, decreasing = TRUE)
+    top_counts <- head(counts, 15)
+    
+    output_lines <- c(paste("Type: Categorical (Detected 'values$item' in API)"),
+                      paste("Total Non-NA:", total),
+                      "Top Categories:")
+    
+    for (code in names(top_counts)) {
+      count <- top_counts[[code]]
+      pct <- round((count / total) * 100, 1)
+      
+      # Map code to label if available
+      lbl <- if (!is.null(label_map) && code %in% names(label_map)) label_map[[code]] else ""
+      lbl_str <- if (nchar(lbl) > 0) paste0("(", lbl, ")") else ""
+      
+      output_lines <- c(output_lines, 
+                        sprintf("  Code %s %s: %d (%s%%)", code, lbl_str, count, pct))
+    }
+    return(paste(output_lines, collapse = "\n"))
+  } 
+  
+  # PATH B: CONTINUOUS
+  else {
+    num_vals <- as.numeric(raw_vals)
+    stats <- summary(num_vals)
+    sd_val <- sd(num_vals, na.rm = TRUE)
+    
+    # Create text histogram
+    bins <- cut(num_vals, breaks = 5)
+    dist <- table(bins)
+    
+    output <- paste0(
+      "Type: Continuous (Detected 'values$range' in API)\n",
+      "Stats: ", paste(names(stats), stats, sep="=", collapse=", "), "\n",
+      "Std Dev: ", round(sd_val, 2), "\n"
+    )
+    
+    # Add Range info if available
+    if (!is.null(valid_range)) {
+      output <- paste0(output, sprintf("Valid Range (Census): %s to %s\n", 
+                                      valid_range[[1]]$min, valid_range[[1]]$max))
+    }
+    
+    output <- paste0(output, "Distribution:\n", paste(names(dist), dist, sep=": ", collapse="\n"))
+    return(output)
+  }
+}
+
+```
+
+
+```{r}
+# --- Define the Tools ---
+
+# 1. The Updated Fetcher Tool
+tool_fetch <- tool(
+  agent_get_cps,
+  name = "get_cps_data_state",
+  description = "Downloads CPS microdata and stores it in agent memory under dataset_name.",
+  arguments = list(
+    year_range = type_array(items = type_integer("Years (no NA).")),
+    variable_list = type_array(items = type_string("Variable codes (no NA).")),
+    state_code = type_string("State FIPS code"),
+    dataset_name = type_string("Optional name to store this dataset (e.g., 'nv_2025_nov'). If omitted, a default is used."),
+    make_active = type_boolean("If TRUE, sets this dataset as active. Default TRUE.")
+  )
+)
+
+
+# 2. The New Analysis Tool
+tool_analyze <- tool(
+  agent_analyze_data,
+  name = "analyze_data",
+  description = "Executes R code on cps_data (bound to active dataset or dataset_name).",
+  arguments = list(
+    r_code = type_string("Valid R/dplyr code that uses cps_data."),
+    dataset_name = type_string("Optional. Dataset to analyze; if omitted, uses active dataset.")
+  )
+)
+
+dictionary_tool <- tool(
+  agent_search_vars,
+  name = "search_cps_variables",
+  description = paste(
+    "Searches the CPS data dictionary to find variable codes based on a keyword.",
+    "Includes memory-aware blocking to prevent repeated searches.",
+    "If a search is blocked, the tool returns suggested alternative synonyms and next steps.",
+    "Use force = TRUE only if you intentionally want to repeat an identical search."
+  ),
+  arguments = list(
+    year = type_string(
+      "The CPS year to search (e.g., '2025')."
+    ),
+    month = type_string(
+      "The 3-letter month abbreviation (e.g., 'jan', 'mar')."
+    ),
+    search_term = type_string(
+      "The keyword to search for (e.g., 'seeing', 'blind', 'industry', 'naics')."
+    ),
+    force = type_boolean(
+      "Optional. Set to TRUE to override repeat-search blocking if you intentionally want to repeat the same search. Default is FALSE."
+    )
+  )
+)
+
+
+tool_weight <- tool(
+  agent_get_weight,
+  name = "get_suggested_weight",
+  description = "Finds the correct statistical weight variable (e.g., 'PWSSWGT') to use for a specific CPS variable.",
+  arguments = list(
+    variable = type_string(description = "The CPS variable code you are analyzing (e.g., 'PEMLR', 'PRTAGE')"),
+    year = type_string(description = "The year of the data (default '2023')")
+  )
+)
+
+
+tool_labels <- tool(
+  agent_get_labels,
+  name = "get_variable_labels",
+  description = "Fetches the official Census definitions for a variable. Returns code mappings (e.g. '1=Employed') for categorical variables, or descriptions for continuous ones.",
+  arguments = list(
+    variable = type_string(description = "The variable code (e.g. 'PEMLR', 'PRTAGE')"),
+    year = type_string(description = "The year (default '2024')"),
+    month = type_string(description = "The 3-letter month abbreviation (e.g. 'jan', 'mar', 'apr'). Default is 'jan'.")
+  )
+)
+
+
+tool_explore <- tool(
+  agent_explore_var,
+  name = "explore_variable",
+  description = "Analyzes a specific variable in the loaded 'cps_data' to provide summary statistics and distributions.",
+  arguments = list(
+    variable = type_string(description = "The CPS variable code to analyze (e.g., 'PEMLR', 'PRTAGE')"),
+    year = type_string(description = "The year of the data (default '2024')"),
+    month = type_string(description = "The 3-letter month abbreviation (e.g., 'jan', 'mar'). Default is 'jan'.")
+  )
+)
+
+sys_prompt <- "
+Reasoning: High
+
+
+You are an expert CPS Data Analyst. You are autonomous, thorough, and communicative.
+
+  Things to REMEMBER:
+  - The data is from the Current Population Survey (CPS).
+  - Each row is a person.
+  - You MUST use statistical weights.
+  - You MUST label results with official definitions.
+  - Data can only be retrieved one state at a time.
+  - Data is time-specific (Year/Month matters).
+  - Data retrieved is for all months in the year range and state specified.
+  - DO NOT PASS NA FOR year_range OR variable_list, this will cause errors.
+  - When you hit an error trying to pull a variable, make sure that it even exists in the data first using agent_search_vars
+  - You don't have to include 'STATE' in the variable_list when using agent_get_cps, that column is included by default.
+  - Make sure you check the definitions of variables before using them.
+  
+  # EXTREMLY IMPORTANT:
+  DO NOT make up numbers or statistics. If you don't have the data, say so. Your answers MUST be based on data you have pulled and analyzed.
+  Make sure you account for the date when analyzing data (e.g., if the user asks about November 2025, filter the data accordingly).
+  Double check that your response makes sense given the data you have, and that you have followed all instructions.
+  
+  # Common errors to AVOID:
+  - Performing calculations without weights
+  - Performing calculations without filtering by date when relevant (data retrieved may span multiple months/years)
+
+  TOOL CALL RULE (MANDATORY):
+  - If you call a tool, output ONLY the tool call.
+
+  STRICT WORKFLOW:
+  1) ASSESS & CLARIFY (ask user if ambiguous; do not call tools)
+  2) PLAN (create_analysis_plan)
+  3) SEARCH (search_cps_variables, get_suggested_weight)
+  4) FETCH (get_cps_data_state)
+  5) EXPLORE (explore_variable)
+  6) CLEAN/ANALYZE (analyze_data)
+  7) LABEL (get_variable_labels)
+  8) RESPOND
+  
+  Continue the workflow until the user's question is fully answered.
+  "
+
+chat_client <- chat_openai_compatible(
+      system_prompt = sys_prompt,
+      base_url = "https://iowa-differences-kijiji-amenities.trycloudflare.com/v1", # Replace your actual endpoint here
+      credentials = function() Sys.getenv("VAST_AI_KEY"),
+      model = "openai/gpt-oss-120b",
+      echo = "output"
+    )
+
+# Register the tools
+chat_client$register_tool(tool_fetch)
+chat_client$register_tool(tool_analyze)
+chat_client$register_tool(dictionary_tool) # The searcher
+chat_client$register_tool(tool_weight) # The weight finder
+chat_client$register_tool(tool_labels) # The label fetcher
+chat_client$register_tool(tool_explore) # The variable explorer
+chat_client$register_tool(tool_transform) # The data transformer
+chat_client$register_tool(tool_plan) # The planning tool
+chat_client$register_tool(tool_list_data) # The dataset lister
+chat_client$register_tool(tool_set_active) # The active dataset setter
+```
+
+```{r}
+res <- chat_client$chat("What variables related to employment status are available in the January 2026 CPS data for Nevada?")
+```
+
+```{r, results="asis"}
+open_md_in_browser <- function(md_text) {
+  html <- markdown::markdownToHTML(md_text, fragment.only = TRUE)
+
+  page <- paste0(
+    "<html><head><meta charset='UTF-8'></head><body>",
+    html,
+    "</body></html>"
+  )
+
+  f <- tempfile(fileext = ".html")
+  writeLines(page, f)
+  browseURL(f)
+}
+
+open_md_in_browser(res)
+
+```
+
+
+
+
+
+
+
+
+
